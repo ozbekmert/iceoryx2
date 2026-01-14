@@ -1,237 +1,126 @@
-# Iceoryx2 Cross-Compilation (AArch64, SD-card Sysroot)
+#!/usr/bin/env bash
+set -euo pipefail
 
-This guide describes a **reproducible, best-practice workflow** to cross-compile the Iceoryx2 stack for **AArch64** using a **physically mounted Raspberry Pi SD-card sysroot**, with **all target artifacts installed into a single prefix**.
+# =============================================================================
+# Iceoryx2 AArch64 cross-build using SD-card sysroot (single-prefix install)
+#
+# Run this script from: external/iceoryx2
+#
+# Requirements on host:
+#   - aarch64-linux-gnu-gcc / aarch64-linux-gnu-g++
+#   - cmake, make/ninja, cargo, rust target aarch64-unknown-linux-gnu
+#
+# Sysroot requirement:
+#   - Raspberry Pi SD card mounted read-only at /mnt/rpi/rootfs
+# =============================================================================
 
-**Target install prefix (single-prefix best practice)**
+# ---- Configuration (override via environment if needed) ----------------------
+SYSROOT="${SYSROOT:-/mnt/rpi/rootfs}"
+TOOLCHAIN_FILE="${TOOLCHAIN_FILE:-$(pwd)/../toolchain/toolchain-aarch64-armgnu.cmake}"
+AARCH64_PREFIX="${AARCH64_PREFIX:-$(pwd)/target/ff/cc/aarch64-install}"
+JOBS="${JOBS:-$(nproc)}"
 
-```
-external/iceoryx2/target/ff/cc/aarch64-install
-```
+# ---- Safety checks -----------------------------------------------------------
+if [[ ! -d "${SYSROOT}" ]]; then
+  echo "[ERROR] SYSROOT not found: ${SYSROOT}"
+  echo "        Mount the SD card rootfs at /mnt/rpi/rootfs (or set SYSROOT)."
+  exit 1
+fi
 
----
+if [[ ! -f "${TOOLCHAIN_FILE}" ]]; then
+  echo "[ERROR] TOOLCHAIN_FILE not found: ${TOOLCHAIN_FILE}"
+  exit 1
+fi
 
-## 1) Mount the Raspberry Pi SD Card (Sysroot)
+if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+  echo "[ERROR] aarch64-linux-gnu-gcc not found on PATH."
+  exit 1
+fi
 
-> Adjust `/dev/sda1` and `/dev/sda2` to match your SD card device.
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "[ERROR] cargo not found on PATH."
+  exit 1
+fi
 
-```bash
-sudo mkdir -p /mnt/rpi/{bootfs,rootfs}
+# Verify sysroot looks like AArch64
+if [[ -x "${SYSROOT}/bin/ls" ]]; then
+  if ! file "${SYSROOT}/bin/ls" | grep -qi "ARM aarch64"; then
+    echo "[ERROR] SYSROOT does not look like AArch64: ${SYSROOT}"
+    file "${SYSROOT}/bin/ls" || true
+    exit 1
+  fi
+else
+  echo "[ERROR] SYSROOT seems incomplete: missing ${SYSROOT}/bin/ls"
+  exit 1
+fi
 
-sudo mount -o ro /dev/sda2 /mnt/rpi/rootfs
-sudo mount -o ro /dev/sda1 /mnt/rpi/bootfs
-```
+mkdir -p "${AARCH64_PREFIX}"
 
-Verify the sysroot is AArch64:
+echo "[INFO] SYSROOT        = ${SYSROOT}"
+echo "[INFO] TOOLCHAIN_FILE = ${TOOLCHAIN_FILE}"
+echo "[INFO] AARCH64_PREFIX = ${AARCH64_PREFIX}"
+echo "[INFO] JOBS           = ${JOBS}"
 
-```bash
-file /mnt/rpi/rootfs/bin/ls
-```
+# ---- 1) Rust FFI -------------------------------------------------------------
+echo "[STEP] cargo build iceoryx2-ffi-c (aarch64-unknown-linux-gnu)"
+cargo build --release --target aarch64-unknown-linux-gnu --package iceoryx2-ffi-c
 
-Expected (example):
+# ---- 2) iceoryx2-cmake-modules (host) ---------------------------------------
+echo "[STEP] build+install iceoryx2-cmake-modules -> ${AARCH64_PREFIX}"
+cmake -S iceoryx2-cmake-modules -B target/ff/cmake-modules/build -DCMAKE_BUILD_TYPE=Release
+cmake --build target/ff/cmake-modules/build -j"${JOBS}"
+cmake --install target/ff/cmake-modules/build --prefix "${AARCH64_PREFIX}"
 
-```
-ELF 64-bit LSB pie executable, ARM aarch64, ...
-```
+# ---- Common CMake args for cross builds -------------------------------------
+CROSS_ARGS=(
+  "-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_FILE}"
+  "-DCMAKE_SYSROOT=${SYSROOT}"
+  "-DCMAKE_BUILD_TYPE=Release"
+  "-DCMAKE_INSTALL_PREFIX=${AARCH64_PREFIX}"
+  "-DCMAKE_PREFIX_PATH=${AARCH64_PREFIX}"
+  "-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc"
+  "-DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++"
+  "-DCMAKE_FIND_ROOT_PATH=${SYSROOT}"
+  "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH"
+  "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY"
+  "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY"
+  "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER"
+  "-DCMAKE_FIND_ROOT_PATH=${AARCH64_PREFIX};${SYSROOT}"
+)
 
----
-
-## 2) Canonical Environment
-
-Run all build commands from:
-
-```
-external/iceoryx2
-```
-
-```bash
-export SYSROOT=/mnt/rpi/rootfs
-export TOOLCHAIN_FILE="$(pwd)/../toolchain/toolchain-aarch64-armgnu.cmake"
-
-# Single authoritative AArch64 install prefix
-export AARCH64_PREFIX="$(pwd)/target/ff/cc/aarch64-install"
-mkdir -p "$AARCH64_PREFIX"
-```
-
----
-
-## 3) Build Rust FFI (AArch64)
-
-```bash
-cargo build --release \
-  --target aarch64-unknown-linux-gnu \
-  --package iceoryx2-ffi-c
-```
-
----
-
-## 4) Build and Install `iceoryx2-cmake-modules` (host tools)
-
-These are CMake helper modules; build on the host and install into the **same target prefix** (single-prefix best practice).
-
-```bash
-cmake -S iceoryx2-cmake-modules \
-  -B target/ff/cmake-modules/build \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build target/ff/cmake-modules/build -j"$(nproc)"
-cmake --install target/ff/cmake-modules/build --prefix "$AARCH64_PREFIX"
-```
-
----
-
-## 5) Cross-Compile and Install `iceoryx2-bb-cxx` (AArch64)
-
-`iceoryx2-cxx` depends on this package.
-
-```bash
+# ---- 3) iceoryx2-bb-cxx ------------------------------------------------------
+echo "[STEP] build+install iceoryx2-bb-cxx -> ${AARCH64_PREFIX}"
 rm -rf target/ff/bb-cxx/build
-
-cmake -S iceoryx2-bb-cxx \
-  -B target/ff/bb-cxx/build \
-  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-  -DCMAKE_SYSROOT="$SYSROOT" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$AARCH64_PREFIX" \
-  -DCMAKE_PREFIX_PATH="$AARCH64_PREFIX" \
-  -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-  -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
-
-cmake --build target/ff/bb-cxx/build -j"$(nproc)"
+cmake -S iceoryx2-bb/cxx -B target/ff/bb-cxx/build "${CROSS_ARGS[@]}"
+cmake --build target/ff/bb-cxx/build -j"${JOBS}"
 cmake --install target/ff/bb-cxx/build
-```
 
----
-
-## 6) Cross-Compile and Install `iceoryx2-c` (AArch64)
-
-```bash
+# ---- 4) iceoryx2-c -----------------------------------------------------------
+echo "[STEP] build+install iceoryx2-c -> ${AARCH64_PREFIX}"
 rm -rf target/ff/c/build
-
-cmake -S iceoryx2-c \
-  -B target/ff/c/build \
-  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-  -DCMAKE_SYSROOT="$SYSROOT" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$AARCH64_PREFIX" \
-  -DRUST_BUILD_ARTIFACT_PATH="$(pwd)/target/aarch64-unknown-linux-gnu/release" \
-  -DCMAKE_PREFIX_PATH="$AARCH64_PREFIX" \
-  -Diceoryx2-cmake-modules_DIR="$AARCH64_PREFIX/lib/cmake/iceoryx2-cmake-modules" \
-  -DCMAKE_FIND_ROOT_PATH="$SYSROOT" \
-  -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
-  -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-  -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-  -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-
-cmake --build target/ff/c/build -j"$(nproc)"
+cmake -S iceoryx2-c -B target/ff/c/build   "${CROSS_ARGS[@]}"   "-DRUST_BUILD_ARTIFACT_PATH=$(pwd)/target/aarch64-unknown-linux-gnu/release"   "-Diceoryx2-cmake-modules_DIR=${AARCH64_PREFIX}/lib/cmake/iceoryx2-cmake-modules"
+cmake --build target/ff/c/build -j"${JOBS}"
 cmake --install target/ff/c/build
-```
 
----
-
-## 7) Cross-Compile and Install `iceoryx_platform` (AArch64)
-
-This comes from your separate iceoryx (classic) repository located at `../iceoryx`.
-
-```bash
+# ---- 5) iceoryx_platform (classic iceoryx repo) ------------------------------
+echo "[STEP] build+install ../iceoryx/iceoryx_platform -> ${AARCH64_PREFIX}"
 rm -rf target/ff/iceoryx/build/platform
-
-cmake -S ../iceoryx/iceoryx_platform \
-  -B target/ff/iceoryx/build/platform \
-  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-  -DCMAKE_SYSROOT="$SYSROOT" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=OFF \
-  -DBUILD_TESTS=OFF \
-  -DCMAKE_INSTALL_PREFIX="$AARCH64_PREFIX" \
-  -DCMAKE_PREFIX_PATH="$AARCH64_PREFIX" \
-  -DCMAKE_FIND_ROOT_PATH="$SYSROOT" \
-  -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
-  -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-  -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-  -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-
-cmake --build target/ff/iceoryx/build/platform -j"$(nproc)"
+cmake -S ../iceoryx/iceoryx_platform -B target/ff/iceoryx/build/platform   "${CROSS_ARGS[@]}"   "-DBUILD_SHARED_LIBS=OFF"   "-DBUILD_TESTS=OFF"
+cmake --build target/ff/iceoryx/build/platform -j"${JOBS}"
 cmake --install target/ff/iceoryx/build/platform
-```
 
----
-
-## 8) Cross-Compile and Install `iceoryx_hoofs` (AArch64)
-
-```bash
-export iceoryx_platform_DIR="$AARCH64_PREFIX/lib/cmake/iceoryx_platform"
-
+# ---- 6) iceoryx_hoofs (classic iceoryx repo) ---------------------------------
+echo "[STEP] build+install ../iceoryx/iceoryx_hoofs -> ${AARCH64_PREFIX}"
 rm -rf target/ff/iceoryx/build/hoofs
-
-cmake -S ../iceoryx/iceoryx_hoofs \
-  -B target/ff/iceoryx/build/hoofs \
-  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-  -DCMAKE_SYSROOT="$SYSROOT" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$AARCH64_PREFIX" \
-  -Diceoryx_platform_DIR="$iceoryx_platform_DIR" \
-  -DCMAKE_PREFIX_PATH="$AARCH64_PREFIX" \
-  -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-  -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
-
-cmake --build target/ff/iceoryx/build/hoofs -j"$(nproc)"
+cmake -S ../iceoryx/iceoryx_hoofs -B target/ff/iceoryx/build/hoofs   "${CROSS_ARGS[@]}"   "-Diceoryx_platform_DIR=${AARCH64_PREFIX}/lib/cmake/iceoryx_platform"
+cmake --build target/ff/iceoryx/build/hoofs -j"${JOBS}"
 cmake --install target/ff/iceoryx/build/hoofs
-```
 
----
-
-## 9) Cross-Compile and Install `iceoryx2-cxx` (AArch64)
-
-```bash
-export iceoryx2_c_DIR="$AARCH64_PREFIX/lib/cmake/iceoryx2-c"
-
+# ---- 7) iceoryx2-cxx ---------------------------------------------------------
+echo "[STEP] build+install iceoryx2-cxx -> ${AARCH64_PREFIX}"
 rm -rf target/ff/cxx/build
-
-cmake -S iceoryx2-cxx \
-  -B target/ff/cxx/build \
-  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-  -DCMAKE_SYSROOT="$SYSROOT" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$AARCH64_PREFIX" \
-  -DCMAKE_PREFIX_PATH="$AARCH64_PREFIX" \
-  -Diceoryx2-c_DIR="$iceoryx2_c_DIR" \
-  -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-  -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
-
-cmake --build target/ff/cxx/build -j"$(nproc)"
+cmake -S iceoryx2-cxx -B target/ff/cxx/build   "${CROSS_ARGS[@]}"   "-Diceoryx2-c_DIR=${AARCH64_PREFIX}/lib/cmake/iceoryx2-c"
+cmake --build target/ff/cxx/build -j"${JOBS}"
 cmake --install target/ff/cxx/build
-```
 
----
-
-## 10) Verification
-
-List a few installed artifacts:
-
-```bash
-find "$AARCH64_PREFIX" -maxdepth 3 -type f \( -name "*.so*" -o -name "*.a" -o -name "*Config.cmake" \) | head -50
-```
-
-Verify architecture of shared libraries (if any):
-
-```bash
-aarch64-linux-gnu-readelf -h "$AARCH64_PREFIX"/lib/*.so* 2>/dev/null | grep -E "Machine|Class" || true
-```
-
-Expected (example):
-
-```
-Machine:                           AArch64
-```
-
----
-
-## Result
-
-All target artifacts are installed under:
-
-```
-target/ff/cc/aarch64-install
-```
-
-This layout is deterministic, CI-friendly, and avoids host/target contamination.
+echo "[DONE] Installed AArch64 artifacts under: ${AARCH64_PREFIX}"
