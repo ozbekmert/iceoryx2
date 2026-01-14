@@ -1,3 +1,6 @@
+Run this script from main directory, not from under docs !
+
+
 #!/usr/bin/env bash
 set -euo pipefail
 
