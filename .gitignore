@@ -6,6 +6,8 @@ debug/
 build
 bazel-*
 CMakeUserPresets.json
+build-iceoryx2-x86_64
+
 
 Cargo.lock
 **/*.rs.bk
