@@ -18,3 +18,18 @@ Cargo.lock
 **/compile_commands.json
 **/*.pyc
 **/*.so
+# build outputs
+build-*/
+**/build-*/
+target/
+**/target/
+install/
+**/install/
+
+# common artifacts
+*.a
+*.o
+*.so
+*.so.*
+*.dylib
+*.dll
